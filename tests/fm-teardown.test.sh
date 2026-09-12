@@ -718,7 +718,7 @@ test_teardown_closes_the_backlog_item_itself() {
     "closed backlog item did not record the task's PR"
   assert_absent "$case_dir/state/task-x1.backlog-close" \
     "a landed close left its pending-close record behind"
-  printf '%s\n' "$out" | grep -F 'tasks-axi ready' >/dev/null \
+  printf '%s\n' "$out" | grep -F 'bin/fm-tasks-axi.sh ready' >/dev/null \
     || fail "teardown dropped the dependency-cleared follow-up: $out"
   printf '%s\n' "$out" | grep -F 'check date gates' >/dev/null \
     || fail "teardown did not preserve date-gate check: $out"
@@ -1965,6 +1965,27 @@ test_teardown_missing_busy_sidecar_completes() {
   assert_absent "$case_dir/state/task-x1.meta" \
     "missing-busy-sidecar: teardown remained incomplete"
   pass "teardown completes when an exact busy-state sidecar is already absent"
+}
+
+test_teardown_retires_the_declared_wait_resume_record() {
+  local case_dir rc
+  case_dir=$(make_case pause-resume-record-cleanup)
+  write_meta "$case_dir" local-only ship
+  # The record bin/fm-pause-resume.sh writes once it has steered an expired
+  # declared wait. Left behind, a reused task id would inherit a declaration that
+  # already counts as nudged, and its own expired wait would never be resumed.
+  printf 'schema=fm-pause-resume.v1\nattempt_epoch=1789185600\ndeclaration=due:1\n' \
+    > "$case_dir/state/task-x1.pause-resume-nudged"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pause-resume-record-cleanup: forced teardown failed: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.pause-resume-nudged" \
+    "pause-resume-record-cleanup: teardown left the declared-wait resume record behind"
+  pass "teardown retires a task's declared-wait resume record"
 }
 
 test_herdr_teardown_clears_escalation_marker() {
@@ -3677,6 +3698,7 @@ test_local_only_force_overrides_unpushed
 test_secondmate_pr_registration_publishes_ready_line
 test_secondmate_home_teardown_delivers_final_line_or_refuses
 test_teardown_missing_busy_sidecar_completes
+test_teardown_retires_the_declared_wait_resume_record
 test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence

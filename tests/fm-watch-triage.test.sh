@@ -2358,7 +2358,7 @@ test_live_declared_wait_churn_honors_the_resurface_throttle() {
 }
 
 test_live_paused_until_controls_recheck_time() {
-  local dir state fakebin out capture_file statusf window key sig wakes future past
+  local dir state fakebin out capture_file statusf window key sig wakes resumes bare future past
   dir=$(make_case live-paused-until); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/parked.status"
   window="test:fm-parked"
@@ -2379,23 +2379,52 @@ test_live_paused_until_controls_recheck_time() {
     "$state/.wake-queue" 2>/dev/null || echo 0)
   [ "$wakes" -eq 0 ] || fail "a live worker produced $wakes wakes before its declared time"
 
+  # The declared time passes. Supervision now also steers the worker back to work
+  # itself (bin/fm-pause-resume.sh), and that steer gets its own report, but it
+  # does NOT suppress this recheck: the sweep wakes and exits the cycle before the
+  # stale path is reached, so the recheck simply lands on a later round. Pin both
+  # halves, because a silent recheck and a missing steer are different defects.
   past=$(iso_utc_at "$(( $(date +%s) - 120 ))")
   printf 'paused: rate limit until %s\n' "$past" >> "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-parked_status"
   printf 'parked, elapsed 3s' > "$capture_file"
   parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit \
     || fail "a live worker did not wake when its declared time passed"
+  resumes=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:parked" { n++ } END { print n + 0 }' \
+    "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$resumes" -eq 1 ] \
+    || fail "a passed declared time produced $resumes resume reports instead of one: $(cat "$state/.wake-queue")"
+  [ -n "$(find "$state/parked.inbox" -maxdepth 1 -type f -name '*.msg' 2>/dev/null)" ] \
+    || fail "the passed declared time did not steer the worker back to work"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the resume report"
+
+  # The pre-existing due recheck still fires, on the next round, unsuppressed.
+  printf 'parked, elapsed 4s' > "$capture_file"
+  parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit \
+    || fail "the due declared-time recheck was suppressed by the resume steer"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
     "$state/.wake-queue" 2>/dev/null || echo 0)
-  [ "$wakes" -eq 1 ] || fail "a passed declared time produced $wakes wakes instead of one"
+  [ "$wakes" -eq 1 ] || fail "a passed declared time produced $wakes recheck wakes instead of one: $(cat "$state/.wake-queue")"
+  # A live parked worker's recheck surfaces through the inconclusive-stale path, so
+  # its wake identity is the plain one, exactly as every other sighting of this
+  # fixture; the declared-wait decoration lives in the row's re-surface scope.
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' \
+    "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$bare" -eq 1 ] \
+    || fail "the due recheck changed the wake identity: $(cat "$state/.wake-queue")"
+  resumes=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:parked" { n++ } END { print n + 0 }' \
+    "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$resumes" -eq 0 ] || fail "the same declaration was steered or reported twice"
   ack_stopped_cycle "$state" || fail "could not acknowledge the due declared-time recheck"
-  printf 'parked, elapsed 4s' > "$capture_file"
+
+  # And the recheck then holds its own long cadence, exactly as before.
+  printf 'parked, elapsed 5s' > "$capture_file"
   parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb \
     || fail "a due declared time bypassed the reset long cadence"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
     "$state/.wake-queue" 2>/dev/null || echo 0)
   [ "$wakes" -eq 0 ] || fail "a due declared time rechecked again inside the long cadence"
-  pass "a live paused worker stays absorbed until its declared time, then rechecks"
+  pass "a live paused worker stays absorbed until its declared time, then is steered back to work and still rechecked"
 }
 
 # --- work the captain is already holding: pane churn must not re-alarm -------

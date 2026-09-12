@@ -1982,6 +1982,39 @@ while :; do
     triage_log "inactive-outcome reconciliation unavailable"
   fi
 
+  # A crew's own expired declared wait. The pause cadence above keeps an idle
+  # `paused:` pane out of the wedge path, and its due branch re-surfaces the wait
+  # once the declared time passes - but re-surfacing only asks firstmate to come
+  # and steer by hand. This sweep performs that steer from supervision itself,
+  # once per declaration, and reports every one it sent or could not send
+  # (bin/fm-pause-resume.sh owns the decision, the text, and the idempotency).
+  # Deliberately independent of the stale backbone: a rate-limited harness often
+  # keeps repainting its pane, and a pane that never holds two identical hashes
+  # never reaches that backbone at all - exactly the worker this must not abandon.
+  #
+  # Skipped entirely under EITHER away marker, which is what makes the sweep's
+  # attended-only scope a fact rather than a claim in its header. The daemon owns
+  # triage and its own expired-declared-wait escalation while the flag exists, and
+  # the posture record covers the harnesses where the captain is away with no
+  # daemon at all; steering from here under either would act outside the scope
+  # this sweep was reviewed for. Extending auto-resume into away mode, bound
+  # against that daemon escalation, is separate follow-up work.
+  if ! afk_present && ! afk_record_present; then
+    pause_resume_out=
+    pause_resume_rc=0
+    pause_resume_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-pause-resume.sh" sweep 2>/dev/null) || pause_resume_rc=$?
+    # Exit 1 is a due task that could not be steered; it names itself on stdout
+    # and so wakes below. Only an unusable sweep is silent, and that is the one
+    # case a triage line has to carry.
+    if [ "$pause_resume_rc" -ge 2 ]; then
+      triage_log "declared-wait resume sweep unavailable (exit $pause_resume_rc)"
+    fi
+    if [ -n "$pause_resume_out" ]; then
+      wake "check: pause-resume"
+    fi
+  fi
+
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed
