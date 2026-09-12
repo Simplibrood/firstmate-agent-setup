@@ -3,9 +3,6 @@
 #
 # Usage:
 #   fm-pause-resume.sh sweep
-#   fm-pause-resume.sh due <task-id>
-#   fm-pause-resume.sh steered <task-id>
-#   fm-pause-resume.sh nudged <task-id>
 #
 # A worker that is deliberately idling on a known external dependency declares
 # it itself with `paused: <why> until <YYYY-MM-DDTHH:MM[:SS]Z>`, and supervision
@@ -33,9 +30,11 @@
 #     it, so the watcher's existing re-ring ladder carries the steer to a worker
 #     that missed its doorbell and escalates one that never picks it up - which
 #     is exactly the worker this sweep exists for;
-#   - appending the durable `check` wake that keeps the action visible, and
-#     recording whether that report landed, so `steered` can tell a reported
-#     steer from one firstmate was never told about.
+#   - appending the durable `check` wake that keeps the action visible,
+#     deduplicated by payload so a repeated identical report cannot pile up while
+#     a genuinely different outcome still gets its own row. The declaration is
+#     recorded only once that report really landed, so an outcome firstmate was
+#     never told about is never filed as delivered.
 #
 # What this script must never do:
 #   - write a task's status file. The worker owns its own ledger; a declaration
@@ -55,19 +54,44 @@
 #   once for that declaration, not once per poll and not once per watcher
 #   process; a task later re-paused with a new deadline - or re-declaring the
 #   same one - is a different declaration and earns its own nudge.
-#   The attempt epoch is recorded BEFORE the send and the declaration only after
-#   it succeeds, so an interrupted or failed send retries after the cooldown
-#   rather than either hammering the worker every poll or going silent forever.
-#   Both directions are deliberate: a nudge a worker did not need is a no-op it
-#   acknowledges and ignores, while never resuming a genuinely waiting worker is
-#   invisible and costs the whole wait.
-#   FM_PAUSE_RESUME_COOLDOWN_SECONDS (default 900, valid 60..86400) is that
-#   floor. It bounds a pathologically re-declaring worker and a persistently
-#   failing send; it never cancels a nudge, only delays it.
+#   The attempt epoch is recorded BEFORE the send, and the declaration only once
+#   the steer landed AND its report was really appended, so an interrupted send,
+#   a failed send, or a report that never reached the queue all retry rather than
+#   being filed as delivered. Both directions are deliberate: a nudge a worker
+#   did not need is a no-op it acknowledges and ignores, while never resuming a
+#   genuinely waiting worker is invisible and costs the whole wait.
 #
-# Away mode is out of scope here: while the away-posture daemon owns triage it
-# also owns its own declared-wait classification (bin/fm-supervise-daemon.sh),
-# and this sweep is wired into the attended watcher poll only.
+# Two different floors, because a retry and a re-declaration are different risks.
+#   Whether the declaration is recorded is what distinguishes them, so no extra
+#   field is needed:
+#   - a recorded declaration means the last attempt was delivered and reported,
+#     so a DIFFERENT declaration arriving after it is paced by
+#     FM_PAUSE_RESUME_COOLDOWN_SECONDS (default 900, valid 60..86400). That floor
+#     exists only to bound a worker re-declaring in a tight loop.
+#   - no recorded declaration means the last attempt failed or was interrupted,
+#     so the retry is paced by the declared wait's OWN recheck cadence,
+#     FM_PAUSE_RESURFACE_SECS (default 14400, owned by bin/fm-classify-lib.sh).
+#     A failing steer must never wake firstmate more often than the wait it
+#     replaced would have on its own cadence; pacing a retry off the tight
+#     cooldown did exactly that, 16x too fast.
+#   Neither floor ever cancels a steer. They only delay it.
+#
+# A positively gone endpoint is not retried at all. When the backend confidently
+# reports the agent dead or missing (bin/fm-backend.sh's fm_backend_agent_alive,
+# the same read bin/fm-watch.sh's pause_state_class uses), no amount of steering
+# will reach it: the task is reported ONCE as needing recovery, the declaration
+# is recorded so the sweep stands down for it, and fm-send's own re-ring ladder
+# owns routing a dead endpoint to recovery from there. Only a confident dead
+# verdict counts; `unknown` liveness is treated as an ordinary retryable failure,
+# so an unreadable endpoint is never mistaken for a gone one.
+#
+# Away mode is excluded, and bin/fm-watch.sh ENFORCES that at the sweep's call
+# site rather than leaving it to this header: the poll loop skips the sweep while
+# either away marker exists. The away-posture daemon owns triage and its own
+# expired-declared-wait escalation (bin/fm-supervise-daemon.sh), so steering from
+# here as well would both act under a posture this script does not cover and
+# surface one moment twice. Extending auto-resume into away mode, bound against
+# that daemon escalation, is separate follow-up work.
 #
 # Cost: one metadata glob plus one last-status-line read per task per poll, all
 # local file reads. A task with no declared wait costs nothing further, and only
@@ -77,16 +101,12 @@
 # sweep prints one line per ACTIONABLE outcome and is otherwise silent, so a
 # caller can treat any output as "something happened":
 #   sent: <id> <until-iso>            one resume steer was recorded
+#   gone: <id> <until-iso>            the endpoint is gone; reported once for recovery
 #   failed: <id> <until-iso> <detail> the steer could not be recorded
 # It exits 0 when nothing failed, 1 when at least one due task could not be
-# nudged, and 2 on unusable configuration.
-# due prints `owed: <id> until=<iso>` and exits 0 when a nudge is owed now, or
-# `held: <id> <reason>` and exits 1 when it is not; 2 on unusable input.
-# steered is the silent read the watcher uses to stand its own due recheck down:
-# exit 0 only when <task-id>'s CURRENT declaration has already been steered AND
-# that steer was reported, so a steer whose report never landed keeps the
-# watcher's own recheck in play rather than silencing both records of one event.
-# nudged prints the recorded declaration record for <task-id>, or exits 1.
+# nudged, and 2 on unusable configuration. A `gone:` task is accounted for
+# rather than failed: nothing further can be delivered to it, and the report
+# naming it for recovery is the whole of what this sweep owes.
 set -u
 export LC_ALL=C
 
@@ -100,6 +120,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
 
 SEND_BIN="${FM_PAUSE_RESUME_SEND_BIN:-$SCRIPT_DIR/fm-send.sh}"
 
@@ -114,6 +136,17 @@ if [ "$FM_PAUSE_RESUME_COOLDOWN_SECONDS" -lt 60 ] || [ "$FM_PAUSE_RESUME_COOLDOW
   printf 'fm-pause-resume: FM_PAUSE_RESUME_COOLDOWN_SECONDS must be a whole number from 60 to 86400\n' >&2
   exit 2
 fi
+
+# The retry floor for a steer that did not land, deliberately the declared wait's
+# OWN recheck cadence rather than the tight re-declaration cooldown above.
+# fm-classify-lib.sh owns the default; this script only consumes it.
+FM_PAUSE_RESUME_RETRY_SECONDS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+case "$FM_PAUSE_RESUME_RETRY_SECONDS" in
+  ''|*[!0-9]*|0)
+    printf 'fm-pause-resume: FM_PAUSE_RESURFACE_SECS must be a positive whole number of seconds\n' >&2
+    exit 2
+    ;;
+esac
 
 FM_PAUSE_RESUME_SEND_BUDGET_SECS=${FM_PAUSE_RESUME_SEND_BUDGET_SECS:-20}
 case "$FM_PAUSE_RESUME_SEND_BUDGET_SECS" in
@@ -130,18 +163,16 @@ fi
 usage() {
   cat <<'EOF'
 usage: fm-pause-resume.sh sweep
-       fm-pause-resume.sh due <task-id>
-       fm-pause-resume.sh nudged <task-id>
 
 sweep   send one resume steer to every crewmate task in this home whose own
         `paused: ... until <time>` declaration has expired and has not already
-        been nudged for that declaration, append the durable wake that reports
-        it, and print one line per actionable outcome.
-due     read-only: exit 0 when a resume nudge is owed for <task-id> right now,
-        1 when it is not, 2 on unusable input. Sends nothing.
-steered read-only and silent: exit 0 only when <task-id>'s current declaration
-        has already been steered and that steer was reported to firstmate.
-nudged  print the recorded nudge declaration for <task-id>.
+        been steered for that declaration, append the durable wake that reports
+        it, and print one line per actionable outcome:
+          sent: <id> <until-iso>            one resume steer was recorded
+          gone: <id> <until-iso>            the endpoint is gone; reported for recovery
+          failed: <id> <until-iso> <detail> the steer could not be recorded
+        Silent when nothing is due. Exits 0 when nothing failed, 1 when at least
+        one due task could not be steered, 2 on unusable configuration.
 EOF
 }
 
@@ -165,12 +196,6 @@ marker_path() {  # <task-id>
 }
 
 record_value() {  # <file> <key>
-  local f=$1 key=$2
-  [ -f "$f" ] && [ ! -L "$f" ] || return 0
-  grep "^${key}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2- || true
-}
-
-meta_field() {  # <meta-file> <key>
   local f=$1 key=$2
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
   grep "^${key}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2- || true
@@ -210,92 +235,120 @@ Supervision sent this automatically when your declared time passed; no reply is 
 EOF
 }
 
-# Is a resume nudge owed for <task-id> right now? A pure read, no side effects.
+# Is a resume steer owed for <task-id> right now? A pure read, no side effects.
 # 0 = owed; PAUSE_RESUME_UNTIL and PAUSE_RESUME_DECLARATION are then set.
-# 1 = not owed; PAUSE_RESUME_HOLD names why.
+# 1 = not owed (no declared wait, not yet due, already steered, or inside a floor).
 # 2 = this task cannot be evaluated at all.
 PAUSE_RESUME_UNTIL=
 PAUSE_RESUME_DECLARATION=
-PAUSE_RESUME_HOLD=
 nudge_owed() {  # <task-id>
-  local id=$1 meta statusf last until now marker attempted recorded age
+  local id=$1 meta statusf last until now marker attempted recorded age floor
   PAUSE_RESUME_UNTIL=
   PAUSE_RESUME_DECLARATION=
-  PAUSE_RESUME_HOLD=
-  valid_id "$id" || { PAUSE_RESUME_HOLD='not a task id'; return 2; }
+  valid_id "$id" || return 2
   meta="$STATE/$id.meta"
-  [ -f "$meta" ] && [ ! -L "$meta" ] || { PAUSE_RESUME_HOLD='no task record'; return 2; }
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 2
   # Crewmate tasks only; this script's header owns why a mate is excluded.
-  if [ "$(meta_field "$meta" kind)" = secondmate ]; then
-    PAUSE_RESUME_HOLD='secondmate'
+  if [ "$(record_value "$meta" kind)" = secondmate ]; then
     return 1
   fi
   statusf="$STATE/$id.status"
   last=$(last_status_line "$statusf")
-  if ! until=$(status_paused_until "$last"); then
-    PAUSE_RESUME_HOLD='no declared wait with a stated time'
-    return 1
-  fi
+  until=$(status_paused_until "$last") || return 1
   now=$(resume_now)
-  if [ "$now" -lt "$until" ]; then
-    PAUSE_RESUME_HOLD="declared time not reached ($(( until - now ))s away)"
-    return 1
-  fi
+  [ "$now" -ge "$until" ] || return 1
   PAUSE_RESUME_UNTIL=$until
-  PAUSE_RESUME_DECLARATION=$(pause_declaration "$statusf" "$until") || {
-    PAUSE_RESUME_HOLD='status log signature unreadable'
-    return 2
-  }
+  PAUSE_RESUME_DECLARATION=$(pause_declaration "$statusf" "$until") || return 2
   marker=$(marker_path "$id")
   recorded=$(record_value "$marker" declaration)
   if [ -n "$recorded" ] && [ "$recorded" = "$PAUSE_RESUME_DECLARATION" ]; then
-    PAUSE_RESUME_HOLD='already nudged for this declaration'
     return 1
+  fi
+  # Which floor paces the next attempt follows from what the last one recorded: a
+  # recorded declaration means it was delivered and reported, so only a tight
+  # re-declaration loop needs bounding; no recorded declaration means it failed or
+  # was interrupted, and a retry must not outpace the wait's own cadence.
+  if [ -n "$recorded" ]; then
+    floor=$FM_PAUSE_RESUME_COOLDOWN_SECONDS
+  else
+    floor=$FM_PAUSE_RESUME_RETRY_SECONDS
   fi
   attempted=$(record_value "$marker" attempt_epoch)
   case "$attempted" in ''|*[!0-9]*) attempted= ;; esac
   if [ -n "$attempted" ]; then
     age=$(( now - attempted ))
     # A clock that moved backwards must not silence the task forever.
-    if [ "$age" -ge 0 ] && [ "$age" -lt "$FM_PAUSE_RESUME_COOLDOWN_SECONDS" ]; then
-      PAUSE_RESUME_HOLD="cooldown ${age}s"
-      return 1
-    fi
+    [ "$age" -lt 0 ] || [ "$age" -ge "$floor" ] || return 1
   fi
   return 0
 }
 
-# Record an attempt, and the declaration only once it actually landed. <reported>
-# says whether firstmate was told; it gates `steered` below.
-write_marker() {  # <task-id> <attempt-epoch> <declaration-or-empty> <reported>
-  local id=$1 epoch=$2 declaration=$3 reported=$4 marker tmp
+# 0 when the task's recorded endpoint is POSITIVELY gone - the backend confidently
+# reports its agent dead or missing. `unknown` is deliberately not gone: an
+# endpoint this home cannot read is retried, never written off.
+endpoint_positively_gone() {  # <task-id>
+  local id=$1 meta window backend
+  meta="$STATE/$id.meta"
+  window=$(record_value "$meta" window)
+  [ -n "$window" ] || return 1
+  backend=$(record_value "$meta" backend)
+  [ -n "$backend" ] || backend=tmux
+  [ "$(fm_backend_agent_alive "$backend" "$window" 2>/dev/null || printf unknown)" = dead ]
+}
+
+# Record an attempt, and the declaration only once the steer landed AND its
+# report was really appended. Whether the declaration is present is what picks
+# the floor in nudge_owed above, so an unreported steer paces like a failure
+# instead of being filed as delivered.
+write_marker() {  # <task-id> <attempt-epoch> <declaration-or-empty>
+  local id=$1 epoch=$2 declaration=$3 marker tmp
   marker=$(marker_path "$id")
   tmp="$marker.tmp.$$"
   {
     printf 'schema=fm-pause-resume.v1\n'
     printf 'attempt_epoch=%s\n' "$epoch"
-    printf 'reported=%s\n' "$reported"
     [ -z "$declaration" ] || printf 'declaration=%s\n' "$declaration"
   } > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f -- "$tmp" "$marker" || { rm -f -- "$tmp"; return 1; }
 }
 
-# One durable wake row per task, skipped while an unhandled one is still queued,
-# so a retried failure cannot pile rows onto a queue nobody has drained yet.
+# Report one outcome durably, deduplicated by PAYLOAD rather than by task key.
+#
+# Key-only dedup was wrong in both directions. A wake row is consumed only by
+# post-handling acknowledgement, so a row stays queued for the whole of
+# firstmate's handling turn - and in that window a row written by an EARLIER
+# outcome can describe the opposite of the current one (a failure row still
+# queued while a later retry succeeded), or belong to an entirely different
+# declaration. Suppressing on the key alone silently dropped those genuinely new
+# events; counting the suppression as "reported" then filed them as delivered.
+#
+# Comparing payloads gets both right: an identical row already queued really does
+# say this exact thing about this exact declaration, so firstmate will see it and
+# nothing more is owed, while any different outcome gets its own row. A repeated
+# identical failure still cannot pile rows up, which is what the dedup was for.
+# The payloads built below are single-line and far under the queue's field cap, so
+# the stored form is byte-identical to what is compared here.
+#   0 = this outcome is on the queue, newly appended or already there
+#   2 = the append failed
 publish_wake() {  # <task-id> <payload>
-  local key="pause-resume:$1" queued
-  queued=$(fm_wake_queued_keys check 2>/dev/null || true)
-  if printf '%s\n' "$queued" | grep -Fx -- "$key" >/dev/null 2>&1; then
+  local key="pause-resume:$1" payload=$2 status=0 existing
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  existing=$(awk -F '\t' -v k="$key" '$3 == "check" && $4 == k { print $5 }' \
+    "$FM_WAKE_QUEUE" 2>/dev/null || true)
+  if printf '%s\n' "$existing" | grep -Fxq -- "$payload"; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
-  fm_wake_append check "$key" "$2"
+  fm_wake_append_locked check "$key" "$payload" || status=2
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
 }
 
 # Send and record for one due task, under this task's own nudge lock so two
 # supervision passes cannot both steer it.
-nudge_task() {  # <task-id> -> 0 sent, 1 failed, 2 nothing owed
-  local id=$1 lock until_iso epoch send_rc=0 detail payload reported
+nudge_task() {  # <task-id> -> 0 sent, 1 failed, 2 nothing owed, 3 endpoint gone
+  local id=$1 lock until_iso epoch send_rc=0 detail payload
   lock="$STATE/.$id.pause-resume.lock"
   fm_lock_try_acquire "$lock" || return 2
   if ! nudge_owed "$id"; then
@@ -304,13 +357,28 @@ nudge_task() {  # <task-id> -> 0 sent, 1 failed, 2 nothing owed
   fi
   until_iso=$(iso_utc "$PAUSE_RESUME_UNTIL")
   epoch=$(resume_now)
-  # The attempt is recorded BEFORE the send: a crash between the two must cost a
-  # cooldown, never a nudge on every poll thereafter.
-  if ! write_marker "$id" "$epoch" '' 0; then
+  # The attempt is recorded BEFORE anything else: a crash between here and the
+  # send must cost a retry floor, never a steer on every poll thereafter.
+  if ! write_marker "$id" "$epoch" ''; then
     fm_lock_release "$lock"
     payload="pause-resume: $id declared its wait until $until_iso, which has passed, but the attempt could not be recorded, so nothing was sent - steer it yourself"
-    publish_wake "$id" "$payload" || true
+    publish_wake "$id" "$payload" >/dev/null 2>&1 || true
     printf 'failed: %s %s could not record the resume attempt\n' "$id" "$until_iso"
+    return 1
+  fi
+  # A positively gone endpoint can never receive a steer, so do not spend one and
+  # do not retry: report it once for recovery and stand down for this declaration.
+  if endpoint_positively_gone "$id"; then
+    payload="pause-resume: $id declared its wait until $until_iso, which has passed, and its endpoint is gone, so no steer can reach it - this task needs recovery"
+    if publish_wake "$id" "$payload" && write_marker "$id" "$epoch" "$PAUSE_RESUME_DECLARATION"; then
+      fm_lock_release "$lock"
+      printf 'gone: %s %s\n' "$id" "$until_iso"
+      return 3
+    fi
+    # The report did not land, so nothing may be filed as delivered; the retry
+    # floor paces the next look rather than this poll repeating it.
+    fm_lock_release "$lock"
+    printf 'failed: %s %s endpoint gone, and the report of it could not be queued\n' "$id" "$until_iso"
     return 1
   fi
   fm_run_timed "$FM_PAUSE_RESUME_SEND_BUDGET_SECS" \
@@ -324,29 +392,26 @@ nudge_task() {  # <task-id> -> 0 sent, 1 failed, 2 nothing owed
       detail="the steer could not be recorded (fm-send exit $send_rc)"
     fi
     payload="pause-resume: $id declared its wait until $until_iso, which has passed, and $detail - steer it yourself"
-    publish_wake "$id" "$payload" || true
+    publish_wake "$id" "$payload" >/dev/null 2>&1 || true
     printf 'failed: %s %s %s\n' "$id" "$until_iso" "$detail"
     return 1
   fi
   payload="pause-resume: $id declared its wait until $until_iso, which has passed; supervision sent the resume steer itself - confirm the work restarted"
-  reported=0
-  publish_wake "$id" "$payload" && reported=1
-  if ! write_marker "$id" "$epoch" "$PAUSE_RESUME_DECLARATION" "$reported"; then
-    # The worker holds the steer; only this home's record of it is missing, so
-    # say so rather than letting the next pass steer again in silence.
+  if ! publish_wake "$id" "$payload"; then
+    # The steer landed but nothing will report it, so nothing may be filed as
+    # delivered: the declaration stays unrecorded and the retry floor paces the
+    # next attempt. A duplicate steer later is a no-op the worker ignores, while a
+    # steer filed as reported when firstmate was never told is not recoverable.
     fm_lock_release "$lock"
-    printf 'failed: %s %s sent, but the nudge record could not be written\n' "$id" "$until_iso"
-    return 1
-  fi
-  fm_lock_release "$lock"
-  if [ "$reported" -ne 1 ]; then
-    # The steer landed but nothing will report it. Say so on this pass, because
-    # an action taken invisibly is exactly what this script must not produce -
-    # and the unreported steer deliberately leaves the watcher's own due recheck
-    # in play (see `steered`), so the event still reaches firstmate somehow.
     printf 'failed: %s %s sent, but the report of it could not be queued\n' "$id" "$until_iso"
     return 1
   fi
+  if ! write_marker "$id" "$epoch" "$PAUSE_RESUME_DECLARATION"; then
+    fm_lock_release "$lock"
+    printf 'failed: %s %s sent and reported, but the steer record could not be written\n' "$id" "$until_iso"
+    return 1
+  fi
+  fm_lock_release "$lock"
   printf 'sent: %s %s\n' "$id" "$until_iso"
   return 0
 }
@@ -362,55 +427,16 @@ cmd_sweep() {
     nudge_owed "$id" || continue
     task_rc=0
     nudge_task "$id" || task_rc=$?
+    # 3 (endpoint gone) is an accounted-for outcome, not a failure to steer.
     [ "$task_rc" -ne 1 ] || rc=1
   done
   return "$rc"
-}
-
-cmd_due() {
-  local id owed_rc=0
-  [ "$#" -eq 1 ] || { usage >&2; exit 2; }
-  id=$1
-  nudge_owed "$id" || owed_rc=$?
-  case "$owed_rc" in
-    0) printf 'owed: %s until=%s\n' "$id" "$(iso_utc "$PAUSE_RESUME_UNTIL")"; return 0 ;;
-    1) printf 'held: %s %s\n' "$id" "$PAUSE_RESUME_HOLD"; return 1 ;;
-    *) fail "$PAUSE_RESUME_HOLD: $id" ;;
-  esac
-}
-
-# The watcher's stand-down read: has this exact declaration already been steered
-# and reported? Silent by contract, because it runs on the watcher's stale path.
-cmd_steered() {  # <task-id>
-  local id owed_rc=0
-  [ "$#" -eq 1 ] || { usage >&2; exit 2; }
-  id=$1
-  nudge_owed "$id" || owed_rc=$?
-  # Anything but "this declaration is already recorded" means no steer covers the
-  # declaration the task is sitting on right now.
-  [ "$owed_rc" -eq 1 ] || return 1
-  [ "$PAUSE_RESUME_HOLD" = 'already nudged for this declaration' ] || return 1
-  [ "$(record_value "$(marker_path "$id")" reported)" = 1 ] || return 1
-  return 0
-}
-
-cmd_nudged() {
-  local id marker
-  [ "$#" -eq 1 ] || { usage >&2; exit 2; }
-  id=$1
-  valid_id "$id" || fail "not a task id: $id"
-  marker=$(marker_path "$id")
-  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
-  cat "$marker"
 }
 
 [ "$#" -ge 1 ] || { usage >&2; exit 2; }
 cmd=$1; shift
 case "$cmd" in
   sweep) cmd_sweep "$@" ;;
-  due) cmd_due "$@" ;;
-  steered) cmd_steered "$@" ;;
-  nudged) cmd_nudged "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

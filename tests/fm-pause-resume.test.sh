@@ -76,7 +76,20 @@ case "${1:-}" in
     printf '╭────╮\n│    │\n╰────╯\n'
     exit 0 ;;
   list-windows)
-    [ -z "${FM_FAKE_TMUX_WINDOWS:-}" ] || printf '%s\n' "$FM_FAKE_TMUX_WINDOWS"
+    # -t <session>: the task endpoint's own session answers from
+    # FM_TEST_ENDPOINT_WINDOWS so the liveness probe sees a live window; every
+    # other session answers from FM_FAKE_TMUX_WINDOWS, which is what the
+    # watcher's own window inventory reads.
+    _sess=; _prev=
+    for _a in "$@"; do
+      [ "$_prev" = -t ] && { _sess=$_a; break; }
+      _prev=$_a
+    done
+    if [ "$_sess" = sess ]; then
+      [ -z "${FM_TEST_ENDPOINT_WINDOWS-fm-t1}" ] || printf '%s\n' "${FM_TEST_ENDPOINT_WINDOWS-fm-t1}"
+    else
+      [ -z "${FM_FAKE_TMUX_WINDOWS:-}" ] || printf '%s\n' "$FM_FAKE_TMUX_WINDOWS"
+    fi
     exit 0 ;;
 esac
 exit 0
@@ -106,6 +119,8 @@ run_resume() {  # <case-dir> <now-epoch> <subcommand...>
     FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$dir/state" \
     FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 \
     FM_SEND_LOG="$dir/send.log" FM_PAUSE_RESUME_NOW="$now" \
+    FM_TEST_ENDPOINT_WINDOWS="${FM_TEST_ENDPOINT_WINDOWS-fm-t1}" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
     ${FM_TEST_RESUME_ENV:+$FM_TEST_RESUME_ENV} \
     "$RESUME" "$@" 2>"$dir/resume.err"
 }
@@ -114,6 +129,12 @@ inbox_count() {  # <case-dir> <id>
   local n
   n=$(find "$1/state/$2.inbox" -maxdepth 1 -type f -name '*.msg' 2>/dev/null | wc -l)
   printf '%s' "${n//[[:space:]]/}"
+}
+
+# Whether the sweep has filed this declaration as delivered. Observable durable
+# state the sweep itself writes, not implementation source.
+declaration_recorded() {  # <case-dir> <id>
+  grep -q '^declaration=' "$1/state/$2.pause-resume-nudged" 2>/dev/null
 }
 
 record_body() {  # <record>
@@ -214,9 +235,8 @@ test_the_same_declaration_is_never_steered_twice() {
   done
   [ "$(inbox_count "$dir" t1)" = 1 ] \
     || fail "repeated supervision passes sent more than one steer for one declaration"
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 9000))" due t1) && fail "due still claims a steer is owed"
-  assert_contains "$out" "already nudged for this declaration" \
-    "due did not name the idempotency record as the reason: $out"
+  declaration_recorded "$dir" t1 \
+    || fail "the delivered steer was not filed against its declaration, so it would be sent again"
   pass "one declaration earns exactly one steer, however many supervision passes see it"
 }
 
@@ -229,9 +249,7 @@ test_a_wait_still_in_force_is_left_alone() {
   out=$(run_resume "$dir" "$((PAST_EPOCH - 600))" sweep) || fail "the sweep failed: $out"
   [ -z "$out" ] || fail "a wait whose declared time has not arrived was steered: $out"
   [ "$(inbox_count "$dir" t1)" = 0 ] || fail "an unexpired wait received a steer"
-  out=$(run_resume "$dir" "$((PAST_EPOCH - 600))" due t1) \
-    && fail "due claimed a steer was owed before the declared time"
-  assert_contains "$out" "declared time not reached" "due gave the wrong reason: $out"
+  declaration_recorded "$dir" t1 && fail "an unexpired wait was filed as steered"
   pass "a declared wait still in force is left to run out"
 }
 
@@ -244,8 +262,8 @@ test_a_pause_with_no_stated_time_is_left_alone() {
   out=$(run_resume "$dir" "$NOW_EPOCH" sweep) || fail "the sweep failed: $out"
   [ -z "$out" ] || fail "an open-ended pause was steered: $out"
   [ "$(inbox_count "$dir" t1)" = 0 ] || fail "an open-ended pause received a steer"
-  out=$(run_resume "$dir" "$NOW_EPOCH" due t1) && fail "due claimed an open-ended pause was due"
-  assert_contains "$out" "no declared wait with a stated time" "due gave the wrong reason: $out"
+  [ ! -e "$dir/state/t1.pause-resume-nudged" ] \
+    || fail "an open-ended pause produced a steer record"
   pass "an open-ended pause has no deadline to pass, so nothing is resumed on its behalf"
 }
 
@@ -295,8 +313,6 @@ test_the_cooldown_bounds_a_rapidly_redeclaring_worker() {
   out=$(run_resume "$dir" "$((NOW_EPOCH + 30))" sweep) || fail "the sweep failed: $out"
   [ -z "$out" ] || fail "a new declaration inside the cooldown was steered at once: $out"
   [ "$(inbox_count "$dir" t1)" = 1 ] || fail "the cooldown did not bound the second steer"
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 30))" due t1) && fail "due ignored the cooldown"
-  assert_contains "$out" "cooldown 30s" "due did not name the cooldown: $out"
 
   # A bound, never a cancellation: past the window the same declaration is steered.
   out=$(run_resume "$dir" "$((NOW_EPOCH + 1000))" sweep) \
@@ -306,7 +322,7 @@ test_the_cooldown_bounds_a_rapidly_redeclaring_worker() {
   pass "the cooldown delays a rapidly re-declaring worker's next steer, and never cancels it"
 }
 
-test_the_cooldown_window_is_fifteen_minutes() {
+test_the_redeclaration_cooldown_window_is_fifteen_minutes() {
   local dir out
   dir=$(make_home window)
   add_task "$dir" t1
@@ -314,12 +330,13 @@ test_the_cooldown_window_is_fifteen_minutes() {
   run_resume "$dir" "$NOW_EPOCH" sweep >/dev/null || fail "the first sweep failed"
   declare_pause "$dir" t1 "$LATER_ISO" "still limited"
 
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 899))" due t1) \
-    && fail "a steer was owed one second inside the window"
-  assert_contains "$out" "cooldown 899s" "the 899s reading was wrong: $out"
-  run_resume "$dir" "$((NOW_EPOCH + 900))" due t1 >/dev/null \
-    || fail "no steer was owed at exactly 900s, so the window is not fifteen minutes"
-  pass "the cooldown window is fifteen minutes"
+  out=$(run_resume "$dir" "$((NOW_EPOCH + 899))" sweep) || fail "the sweep failed: $out"
+  [ -z "$out" ] || fail "a re-declaration was steered one second inside the window: $out"
+  out=$(run_resume "$dir" "$((NOW_EPOCH + 900))" sweep) \
+    || fail "the sweep failed at the window boundary: $(cat "$dir/resume.err")"
+  assert_contains "$out" "sent: t1" \
+    "no steer was sent at exactly 900s, so the re-declaration window is not fifteen minutes: $out"
+  pass "the re-declaration cooldown window is fifteen minutes"
 }
 
 test_a_secondmate_is_never_steered_by_this_sweep() {
@@ -331,12 +348,12 @@ test_a_secondmate_is_never_steered_by_this_sweep() {
   out=$(run_resume "$dir" "$NOW_EPOCH" sweep) || fail "the sweep failed: $out"
   [ -z "$out" ] || fail "a persistent secondmate was steered by the crewmate sweep: $out"
   [ "$(inbox_count "$dir" m1)" = 0 ] || fail "a secondmate received a crewmate resume steer"
-  out=$(run_resume "$dir" "$NOW_EPOCH" due m1) && fail "due claimed a secondmate was due"
-  assert_contains "$out" "secondmate" "due did not name the excluded kind: $out"
+  [ ! -e "$dir/state/m1.pause-resume-nudged" ] \
+    || fail "a secondmate got a steer record from the crewmate sweep"
   pass "the sweep is crewmate-only: a persistent secondmate's own wait is its home's business"
 }
 
-test_a_failed_steer_reports_itself_and_retries_after_the_cooldown() {
+test_a_failed_steer_reports_itself_and_retries_only_after_the_long_floor() {
   local dir out fake
   dir=$(make_home failed)
   add_task "$dir" t1
@@ -358,16 +375,19 @@ test_a_failed_steer_reports_itself_and_retries_after_the_cooldown() {
   assert_grep "steer it yourself" "$dir/state/.wake-queue" \
     "a failed steer did not hand the task back to firstmate: $(cat "$dir/state/.wake-queue")"
   # The declaration is deliberately NOT recorded, so the steer is retried.
-  run_resume "$dir" "$NOW_EPOCH" nudged t1 | grep -q '^declaration=' \
-    && fail "a failed steer recorded its declaration as delivered"
+  declaration_recorded "$dir" t1 && fail "a failed steer recorded its declaration as delivered"
 
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 30))" sweep) || fail "the retry sweep failed: $out"
-  [ -z "$out" ] || fail "a failed steer retried inside the cooldown: $out"
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 1000))" sweep) \
+  # A failing steer must never wake firstmate faster than the wait it replaced, so
+  # the retry is paced by the declared wait's own cadence, not the tight
+  # re-declaration cooldown. 1000s is past that cooldown and well inside the
+  # cadence: a retry here would be the 16x-too-fast loop this pins against.
+  out=$(run_resume "$dir" "$((NOW_EPOCH + 1000))" sweep) || fail "the retry sweep failed: $out"
+  [ -z "$out" ] || fail "a failed steer retried on the tight re-declaration cooldown: $out"
+  out=$(run_resume "$dir" "$((NOW_EPOCH + 14400))" sweep) \
     || fail "a failed steer was never retried: $(cat "$dir/resume.err")"
   assert_contains "$out" "sent: t1" "the retry did not deliver: $out"
   [ "$(inbox_count "$dir" t1)" = 1 ] || fail "the retried steer did not land"
-  pass "a failed steer is reported, never silently recorded as sent, and retried after the window"
+  pass "a failed steer is reported, never filed as sent, and retried only on the wait's own cadence"
 }
 
 test_a_broken_doorbell_is_still_a_delivered_steer() {
@@ -385,28 +405,7 @@ test_a_broken_doorbell_is_still_a_delivered_steer() {
   pass "the durable record is the delivery: a ring that could not land is still a sent steer"
 }
 
-test_steered_answers_only_for_the_declaration_in_force() {
-  local dir
-  dir=$(make_home steered)
-  add_task "$dir" t1
-  declare_pause "$dir" t1 "$PAST_ISO"
-
-  run_resume "$dir" "$NOW_EPOCH" steered t1 \
-    && fail "steered claimed an unsent steer covered the declaration"
-  run_resume "$dir" "$NOW_EPOCH" sweep >/dev/null || fail "the sweep failed"
-  run_resume "$dir" "$NOW_EPOCH" steered t1 \
-    || fail "steered did not recognize the steer it had just recorded"
-  [ ! -s "$dir/resume.err" ] || fail "steered is not silent: $(cat "$dir/resume.err")"
-
-  # A NEW declaration is not covered by the steer sent for the old one, which is
-  # what keeps the watcher's own recheck in play for a wait nobody has answered.
-  declare_pause "$dir" t1 "$LATER_ISO" "still limited"
-  run_resume "$dir" "$((NOW_EPOCH + 5))" steered t1 \
-    && fail "steered let an old steer cover a fresh declaration"
-  pass "steered answers for the declaration the task is sitting on now, not an earlier one"
-}
-
-test_an_unreported_steer_keeps_the_watchers_own_recheck_in_play() {
+test_an_unreported_outcome_is_never_filed_as_delivered() {
   local dir out
   dir=$(make_home unreported)
   add_task "$dir" t1
@@ -420,27 +419,134 @@ test_an_unreported_steer_keeps_the_watchers_own_recheck_in_play() {
   assert_contains "$out" "report of it could not be queued" \
     "the unreported steer did not say so: $out"
   [ "$(inbox_count "$dir" t1)" = 1 ] || fail "the steer itself did not land"
-  run_resume "$dir" "$NOW_EPOCH" steered t1 \
-    && fail "an unreported steer stood the watcher's own recheck down, hiding the event entirely"
-  # It is still recorded as sent, so the worker is not steered twice for it.
-  out=$(run_resume "$dir" "$((NOW_EPOCH + 9000))" sweep) || true
-  [ "$(inbox_count "$dir" t1)" = 1 ] \
-    || fail "an unreported steer was sent again instead of being left to the recheck"
+  declaration_recorded "$dir" t1 \
+    && fail "a steer firstmate was never told about was filed as delivered"
   chmod 600 "$dir/state/.wake-queue"
-  pass "a steer firstmate was never told about leaves the watcher's own recheck in play"
+  pass "an outcome firstmate was never told about is never filed as delivered"
 }
 
-test_an_untracked_or_unknown_task_is_refused_not_guessed() {
+test_an_older_queued_report_never_swallows_a_different_outcome() {
+  local dir out rows
+  dir=$(make_home queued)
+  add_task "$dir" t1
+  declare_pause "$dir" t1 "$PAST_ISO"
+  # An unhandled row for this task is already queued, written by an earlier
+  # outcome. Wake rows are consumed only by post-handling acknowledgement, so it
+  # can sit there describing the opposite of what happens next - which is exactly
+  # when a dedup keyed on the task alone would drop the newer event.
+  printf '%s\t1\tcheck\tpause-resume:t1\tpause-resume: t1 could not be steered - steer it yourself\n' \
+    "$NOW_EPOCH" > "$dir/state/.wake-queue"
+
+  out=$(run_resume "$dir" "$NOW_EPOCH" sweep) \
+    || fail "a successful steer was lost behind an older queued row: $out $(cat "$dir/resume.err")"
+  assert_contains "$out" "sent: t1" "the steer was not reported as sent: $out"
+  rows=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:t1" { n++ } END { print n + 0 }' \
+    "$dir/state/.wake-queue")
+  [ "$rows" -eq 2 ] \
+    || fail "the new outcome did not get its own durable row ($rows rows): $(cat "$dir/state/.wake-queue")"
+  declaration_recorded "$dir" t1 \
+    || fail "a reported steer was not filed against its declaration"
+  pass "a queued row from an earlier outcome never swallows a different one"
+}
+
+test_an_identical_report_is_not_queued_twice() {
+  local dir out rows
+  dir=$(make_home identical)
+  add_task "$dir" t1
+  declare_pause "$dir" t1 "$PAST_ISO"
+  # A failing send, twice, past the retry floor: the second failure says exactly
+  # what the first one said, and an undrained queue must not collect both.
+  printf '#!/usr/bin/env bash\nexit 7\n' > "$dir/failing-send.sh"
+  chmod +x "$dir/failing-send.sh"
+
+  FM_TEST_RESUME_ENV="FM_PAUSE_RESUME_SEND_BIN=$dir/failing-send.sh" \
+    run_resume "$dir" "$NOW_EPOCH" sweep >/dev/null
+  out=$(FM_TEST_RESUME_ENV="FM_PAUSE_RESUME_SEND_BIN=$dir/failing-send.sh" \
+    run_resume "$dir" "$((NOW_EPOCH + 14400))" sweep) && fail "the failing send reported success: $out"
+  rows=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:t1" { n++ } END { print n + 0 }' \
+    "$dir/state/.wake-queue")
+  [ "$rows" -eq 1 ] \
+    || fail "a repeated identical failure piled $rows rows onto an undrained queue: $(cat "$dir/state/.wake-queue")"
+  pass "a repeated identical report is never queued twice onto an undrained queue"
+}
+
+test_a_status_log_with_no_task_record_is_never_steered() {
   local dir out
   dir=$(make_home unknown)
-  out=$(run_resume "$dir" "$NOW_EPOCH" due nosuch) && fail "due accepted an unknown task"
-  expect_code 2 "$?" "an unknown task should be refused, not reported as not-due"
-  assert_contains "$(cat "$dir/resume.err")" "no task record" \
-    "the refusal did not name the missing record: $(cat "$dir/resume.err")"
-  out=$(run_resume "$dir" "$NOW_EPOCH" due 'bad id') && fail "due accepted a malformed id"
-  assert_contains "$(cat "$dir/resume.err")" "not a task id" \
-    "a malformed id was not refused by name: $(cat "$dir/resume.err")"
-  pass "an unknown or malformed task id is refused loudly rather than silently skipped"
+  # A status log carrying a due declared wait but no task record in this home.
+  declare_pause "$dir" orphan "$PAST_ISO"
+
+  out=$(run_resume "$dir" "$NOW_EPOCH" sweep) || fail "the sweep failed: $out"
+  [ -z "$out" ] || fail "a status log with no task record was steered: $out"
+  [ ! -e "$dir/state/orphan.inbox" ] || fail "a task this home does not carry received a steer"
+  pass "only a task this home actually carries is ever steered"
+}
+
+test_away_posture_stops_the_sweep_from_steering_at_all() {
+  local dir pid out i marker
+  for marker in .afk .afk-contract; do
+    dir=$(make_home "away${marker//./-}")
+    add_task "$dir" t1
+    declare_pause "$dir" t1 "$PAST_ISO"
+    out="$dir/watch.out"
+    : > "$dir/state/$marker"
+
+    # The real watcher poll, the only place the sweep is reached from.
+    PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" \
+      FM_STATE_OVERRIDE="$dir/state" FM_WATCH_HANDLING_SUCCESSOR=1 \
+      FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 FM_SEND_LOG="$dir/send.log" \
+      FM_PAUSE_RESUME_NOW="$NOW_EPOCH" FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+      FM_TEST_ENDPOINT_WINDOWS=fm-t1 \
+      FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+      "$WATCH" > "$out" 2>"$dir/watch.err" &
+    pid=$!
+    i=0
+    while [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+    reap "$pid"
+
+    [ "$(inbox_count "$dir" t1)" = 0 ] \
+      || fail "[$marker] the sweep steered a worker while the away posture was active"
+    [ ! -e "$dir/state/t1.pause-resume-nudged" ] \
+      || fail "[$marker] the sweep recorded an attempt while the away posture was active"
+    assert_not_contains "$(cat "$out")" "check: pause-resume" \
+      "[$marker] the sweep reported a resume while the away posture was active: $(cat "$out")"
+
+    # Same fixture, posture cleared: the identical declaration IS steered, so the
+    # guard is what held it back rather than the fixture never being due.
+    rm -f "$dir/state/$marker"
+    out=$(run_resume "$dir" "$NOW_EPOCH" sweep) \
+      || fail "[$marker] the same fixture was not steerable once the posture cleared: $(cat "$dir/resume.err")"
+    assert_contains "$out" "sent: t1" \
+      "[$marker] clearing the away posture did not let the steer through: $out"
+  done
+  pass "away posture stops the sweep entirely, in either of its two markers"
+}
+
+test_a_gone_endpoint_is_reported_once_for_recovery_and_never_retried() {
+  local dir out
+  dir=$(make_home gone)
+  add_task "$dir" t1
+  declare_pause "$dir" t1 "$PAST_ISO"
+  # A reachable server whose window is simply not there any more - the shape a
+  # harness exit leaves behind when it takes its pane with it. That is what the
+  # backend reports as positively gone; an unreadable endpoint stays retryable.
+  out=$(FM_TEST_ENDPOINT_WINDOWS='' run_resume "$dir" "$NOW_EPOCH" sweep) \
+    || fail "the sweep failed: $out $(cat "$dir/resume.err")"
+  assert_contains "$out" "gone: t1 2026-09-12T03:00:00Z" \
+    "a gone endpoint was not reported as gone: $out"
+  [ "$(inbox_count "$dir" t1)" = 0 ] \
+    || fail "a steer was spent on an endpoint that cannot receive one"
+  assert_grep "needs recovery" "$dir/state/.wake-queue" \
+    "the gone endpoint was not handed to recovery: $(cat "$dir/state/.wake-queue")"
+  declaration_recorded "$dir" t1 \
+    || fail "a gone endpoint was not stood down, so it would be reported again"
+
+  # Never retried: not on the tight cooldown, and not on the long cadence either.
+  out=$(FM_TEST_ENDPOINT_WINDOWS='' run_resume "$dir" "$((NOW_EPOCH + 1000))" sweep) || fail "the sweep failed: $out"
+  [ -z "$out" ] || fail "a gone endpoint was re-reported inside the cooldown: $out"
+  out=$(FM_TEST_ENDPOINT_WINDOWS='' run_resume "$dir" "$((NOW_EPOCH + 100000))" sweep) || fail "the sweep failed: $out"
+  [ -z "$out" ] || fail "a gone endpoint was re-reported on the long cadence: $out"
+  pass "a positively gone endpoint is reported once for recovery and never steered or retried"
 }
 
 test_other_homes_tasks_are_never_touched() {
@@ -474,7 +580,8 @@ test_the_watcher_poll_sends_the_steer_and_surfaces_it() {
   PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" \
     FM_STATE_OVERRIDE="$dir/state" FM_WATCH_HANDLING_SUCCESSOR=1 \
     FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 FM_SEND_LOG="$dir/send.log" \
-    FM_PAUSE_RESUME_NOW="$NOW_EPOCH" \
+    FM_PAUSE_RESUME_NOW="$NOW_EPOCH" FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+      FM_TEST_ENDPOINT_WINDOWS=fm-t1 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$WATCH" > "$out" 2>"$dir/watch.err" &
   pid=$!
@@ -495,7 +602,8 @@ test_the_watcher_poll_sends_the_steer_and_surfaces_it() {
   PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" \
     FM_STATE_OVERRIDE="$dir/state" FM_WATCH_HANDLING_SUCCESSOR=1 \
     FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 FM_SEND_LOG="$dir/send.log" \
-    FM_PAUSE_RESUME_NOW="$((NOW_EPOCH + 5))" \
+    FM_PAUSE_RESUME_NOW="$((NOW_EPOCH + 5))" FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_TEST_ENDPOINT_WINDOWS=fm-t1 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$WATCH" >> "$out" 2>>"$dir/watch.err" &
   pid=$!
@@ -517,12 +625,15 @@ test_a_pause_with_no_stated_time_is_left_alone
 test_a_worker_that_moved_on_is_left_alone
 test_a_re_declared_deadline_earns_its_own_steer
 test_the_cooldown_bounds_a_rapidly_redeclaring_worker
-test_the_cooldown_window_is_fifteen_minutes
+test_the_redeclaration_cooldown_window_is_fifteen_minutes
 test_a_secondmate_is_never_steered_by_this_sweep
-test_a_failed_steer_reports_itself_and_retries_after_the_cooldown
+test_a_failed_steer_reports_itself_and_retries_only_after_the_long_floor
 test_a_broken_doorbell_is_still_a_delivered_steer
-test_steered_answers_only_for_the_declaration_in_force
-test_an_unreported_steer_keeps_the_watchers_own_recheck_in_play
-test_an_untracked_or_unknown_task_is_refused_not_guessed
+test_an_unreported_outcome_is_never_filed_as_delivered
+test_an_older_queued_report_never_swallows_a_different_outcome
+test_an_identical_report_is_not_queued_twice
+test_a_status_log_with_no_task_record_is_never_steered
+test_away_posture_stops_the_sweep_from_steering_at_all
+test_a_gone_endpoint_is_reported_once_for_recovery_and_never_retried
 test_other_homes_tasks_are_never_touched
 test_the_watcher_poll_sends_the_steer_and_surfaces_it
