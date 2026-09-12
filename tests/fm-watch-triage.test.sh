@@ -2358,7 +2358,7 @@ test_live_declared_wait_churn_honors_the_resurface_throttle() {
 }
 
 test_live_paused_until_controls_recheck_time() {
-  local dir state fakebin out capture_file statusf window key sig wakes future past
+  local dir state fakebin out capture_file statusf window key sig wakes resumes future past
   dir=$(make_case live-paused-until); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/parked.status"
   window="test:fm-parked"
@@ -2379,23 +2379,37 @@ test_live_paused_until_controls_recheck_time() {
     "$state/.wake-queue" 2>/dev/null || echo 0)
   [ "$wakes" -eq 0 ] || fail "a live worker produced $wakes wakes before its declared time"
 
+  # The declared time passes. Supervision now answers that itself: it steers the
+  # worker back to work through bin/fm-pause-resume.sh and reports the steer, so
+  # the wake carrying this moment is that report rather than a bare recheck. The
+  # two are records of one event, so exactly ONE of them may fire.
   past=$(iso_utc_at "$(( $(date +%s) - 120 ))")
   printf 'paused: rate limit until %s\n' "$past" >> "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-parked_status"
   printf 'parked, elapsed 3s' > "$capture_file"
   parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" exit \
     || fail "a live worker did not wake when its declared time passed"
+  resumes=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:parked" { n++ } END { print n + 0 }' \
+    "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$resumes" -eq 1 ] \
+    || fail "a passed declared time produced $resumes resume reports instead of one: $(cat "$state/.wake-queue")"
+  [ -n "$(find "$state/parked.inbox" -maxdepth 1 -type f -name '*.msg' 2>/dev/null)" ] \
+    || fail "the passed declared time did not steer the worker back to work"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
     "$state/.wake-queue" 2>/dev/null || echo 0)
-  [ "$wakes" -eq 1 ] || fail "a passed declared time produced $wakes wakes instead of one"
-  ack_stopped_cycle "$state" || fail "could not acknowledge the due declared-time recheck"
+  [ "$wakes" -eq 0 ] \
+    || fail "the passed declared time surfaced twice, as a resume report and a bare recheck: $(cat "$state/.wake-queue")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the due declared-time resume report"
   printf 'parked, elapsed 4s' > "$capture_file"
   parked_watch_round "$state" "$fakebin" "$out" "$capture_file" "$window" absorb \
     || fail "a due declared time bypassed the reset long cadence"
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' \
     "$state/.wake-queue" 2>/dev/null || echo 0)
+  resumes=$(awk -F '\t' '$3 == "check" && $4 == "pause-resume:parked" { n++ } END { print n + 0 }' \
+    "$state/.wake-queue" 2>/dev/null || echo 0)
   [ "$wakes" -eq 0 ] || fail "a due declared time rechecked again inside the long cadence"
-  pass "a live paused worker stays absorbed until its declared time, then rechecks"
+  [ "$resumes" -eq 0 ] || fail "a steered declaration was steered or reported again inside the long cadence"
+  pass "a live paused worker stays absorbed until its declared time, then is steered back to work once"
 }
 
 # --- work the captain is already holding: pane churn must not re-alarm -------

@@ -967,6 +967,33 @@ busy_turn_over_age() {  # <task>
   [ "$(age_of "$f")" -ge "$BUSY_TURN_MAX_SECS" ]
 }
 
+# Bind a DUE declared wait's re-surface to the resume steer supervision already
+# sent and reported for this exact declaration (bin/fm-pause-resume.sh). Both are
+# records of one event - the declared time passed - and the steer's own wake says
+# strictly more than "confirm the wait cleared", so the recheck stands down
+# rather than surfacing the same moment twice.
+#
+# Standing down is NOT going quiet: the window's throttle is seeded ONCE with the
+# returned scope, so the ordinary PAUSE_RESURFACE_SECS cadence now measures from
+# the steer and a worker that ignored it re-surfaces on that cadence exactly as a
+# forgotten wait always has. Seeded once, because re-seeding every poll would
+# keep pushing that cadence out and let the wait rot invisibly after all.
+# An unreported steer deliberately fails this bind, so a steer firstmate was
+# never told about leaves the recheck in play.
+# Prints the scope to use and returns 0 when the steer is bound, 1 when it is not
+# and the caller keeps its own due behavior.
+pause_resume_bound_scope() {  # <window-key> <task> <due-scope>
+  local key=$1 task=$2 scope="$3:resumed" throttle
+  [ -n "$task" ] || return 1
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-pause-resume.sh" steered "$task" >/dev/null 2>&1 || return 1
+  throttle="$STATE/.paused-resurfaced-$key"
+  if [ "$(cat "$throttle" 2>/dev/null || true)" != "$scope" ]; then
+    printf '%s' "$scope" > "$throttle" || return 1
+  fi
+  printf '%s' "$scope"
+}
+
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
 # dead-agent captain-held transfer, and re-surface it once every
 # PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
@@ -984,7 +1011,7 @@ busy_turn_over_age() {  # <task>
 # wording; a caller that reached the bounded cadence off pause tracking alone, with
 # no declaring verb left on the log, keeps the external-wait wording it always had.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age detail reason declaration last until now min_age
+  local win=$1 task=$2 h=$3 key statusf mtime age detail reason declaration last until now min_age bound
   key=$(window_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
@@ -1014,11 +1041,17 @@ handle_paused_stale() {  # <window> <task> <hash>
       reason="paused ${age}s, awaiting external - the declared time is beyond the recheck cadence; confirm the wait still holds"
     else
       # The declared time has passed: recheck now, once per declaration, then
-      # hold the cadence.
+      # hold the cadence - unless supervision already steered this declaration
+      # and reported it, in which case that wake is this moment's record.
       detail="paused, declared time reached"
       reason="paused ${age}s, awaiting external - the declared clearing time has passed, rechecked on a long cadence not a wedge; confirm the wait cleared"
       declaration="$declaration:due"
-      min_age=0
+      if bound=$(pause_resume_bound_scope "$key" "$task" "$declaration"); then
+        detail="paused, declared time reached, resume already steered and reported"
+        declaration=$bound
+      else
+        min_age=0
+      fi
     fi
   else
     detail="paused, awaiting external"
@@ -1288,7 +1321,7 @@ captain_call_stale_bound() {  # <window-key> <task>
 # above): the status line the worker declared, and the backlog hold firstmate
 # recorded once the captain took the work in hand.
 surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last declared=1 bounded=1 throttled=1 until now
+  local win=$1 h=$2 key task last declared=1 bounded=1 throttled=1 until now bound
   key=$(window_key "$win")
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
@@ -1303,6 +1336,12 @@ surface_nonterminal_stale() {  # <window> <hash>
         throttled=0
       else
         STALE_WAIT_DECLARATION="$STALE_WAIT_DECLARATION:due"
+        # Same bind as the absorbed path above: a steered-and-reported declaration
+        # has already had its wake, so this sighting takes the ordinary cadence
+        # measured from that steer instead of alarming again.
+        if bound=$(pause_resume_bound_scope "$key" "$task" "$STALE_WAIT_DECLARATION"); then
+          STALE_WAIT_DECLARATION=$bound
+        fi
         stale_wait_throttled "$key" "$STALE_WAIT_DECLARATION" && throttled=0
       fi
     else
@@ -1980,6 +2019,29 @@ while :; do
     fi
   else
     triage_log "inactive-outcome reconciliation unavailable"
+  fi
+
+  # A crew's own expired declared wait. The pause cadence above keeps an idle
+  # `paused:` pane out of the wedge path, and its due branch re-surfaces the wait
+  # once the declared time passes - but re-surfacing only asks firstmate to come
+  # and steer by hand. This sweep performs that steer from supervision itself,
+  # once per declaration, and reports every one it sent or could not send
+  # (bin/fm-pause-resume.sh owns the decision, the text, and the idempotency).
+  # Deliberately independent of the stale backbone: a rate-limited harness often
+  # keeps repainting its pane, and a pane that never holds two identical hashes
+  # never reaches that backbone at all - exactly the worker this must not abandon.
+  pause_resume_out=
+  pause_resume_rc=0
+  pause_resume_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-pause-resume.sh" sweep 2>/dev/null) || pause_resume_rc=$?
+  # Exit 1 is a due task that could not be steered; it names itself on stdout and
+  # so wakes below. Only an unusable sweep is silent, and that is the one case a
+  # triage line has to carry.
+  if [ "$pause_resume_rc" -ge 2 ]; then
+    triage_log "declared-wait resume sweep unavailable (exit $pause_resume_rc)"
+  fi
+  if [ -n "$pause_resume_out" ]; then
+    wake "check: pause-resume"
   fi
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
