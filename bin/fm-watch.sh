@@ -850,6 +850,65 @@ EOF
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+# The quiet feed (bin/fm-quiet-feed.sh) is where an event the watcher settles by
+# itself is written down for the captain. Recording is ALWAYS best-effort and
+# never gates a wake: a bookkeeping failure must not change what supervision does,
+# so every call below is fire-and-forget and its own script owns the bounded log.
+QUIET_FEED_BIN="${FM_QUIET_FEED_BIN:-$SCRIPT_DIR/fm-quiet-feed.sh}"
+
+# How long a declared wait whose declaration and status log are both unchanged may
+# be rechecked onto the quiet feed before one recheck wakes firstmate anyway. The
+# hard bound is what stops a forgotten wait rotting invisibly: PAUSE_RESURFACE_SECS
+# still decides how often the wait is LOOKED at, and this decides how often looking
+# at it costs a firstmate turn.
+QUIET_WAIT_WAKE_SECS=${FM_QUIET_WAIT_WAKE_SECS:-86400}
+case "$QUIET_WAIT_WAKE_SECS" in ''|*[!0-9]*) QUIET_WAIT_WAKE_SECS=86400 ;; esac
+
+
+# The subject a settled signal batch is recorded under: the one task it names, or
+# a plain count when a coalesced batch spans several. Never a path - the page is
+# read by the captain, not by a supervisor.
+signal_batch_subject() {  # <file> ...
+  local f base tasks='' n=0
+  for f in "$@"; do
+    base=${f##*/}
+    base=${base%.status}
+    base=${base%.turn-ended}
+    case " $tasks " in *" $base "*) continue ;; esac
+    tasks="$tasks $base"
+    n=$(( n + 1 ))
+  done
+  if [ "$n" -eq 1 ]; then printf '%s' "${tasks# }"; else printf '%s workers' "$n"; fi
+}
+
+# A duration for the captain's page. The wake reason keeps its exact seconds
+# because a supervisor acts on those; a page is read, not acted on, so it gets
+# the rounded form a person uses.
+human_secs() {  # <seconds>
+  local s=$1
+  case "$s" in ''|*[!0-9]*) printf 'a moment'; return ;; esac
+  if [ "$s" -lt 90 ]; then printf '%s seconds' "$s"
+  elif [ "$s" -lt 5400 ]; then printf '%s minutes' "$(( s / 60 ))"
+  elif [ "$s" -lt 172800 ]; then printf '%s hours' "$(( s / 3600 ))"
+  else printf '%s days' "$(( s / 86400 ))"
+  fi
+}
+
+# Write one settled event to the captain's quiet feed. Failure is swallowed by
+# design (see QUIET_FEED_BIN above).
+quiet_feed_record() {  # <kind> <subject> <detail> [next-seconds]
+  local kind=$1 subject=$2 detail=$3 next=${4-}
+  [ -x "$QUIET_FEED_BIN" ] || return 0
+  if [ -n "$next" ]; then
+    "$QUIET_FEED_BIN" record --kind "$kind" --task "$subject" --detail "$detail" \
+      --next "$next" --best-effort >/dev/null 2>&1 || true
+  else
+    "$QUIET_FEED_BIN" record --kind "$kind" --task "$subject" --detail "$detail" \
+      --best-effort >/dev/null 2>&1 || true
+  fi
+}
+
+
 # One bounded re-surface for a pane the watcher is deliberately absorbing, so no
 # absorb can rot invisibly. <age> is how long the current absorb has held and
 # <throttle> is the per-window marker whose mtime records the last re-surface, so
@@ -863,14 +922,38 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # <min-age> replaces the cadence as the absorb-age gate for one call (0 lets a
 # declared `until` time that has just passed re-surface at once), while the
 # throttle keeps the cadence between repeats.
-resurface_absorbed() {  # <window> <throttle-marker> <age> <reason> [scope] [min-age]
+resurface_absorbed() {  # <window> <throttle> <age> <reason> [scope] [min-age] [quiet-marker] [quiet-kind] [quiet-detail]
   local win=$1 throttle=$2 age=$3 reason=$4 scope=${5-} min_age=${6:-$PAUSE_RESURFACE_SECS}
-  if [ -z "$scope" ] || [ ! -e "$throttle" ] \
-    || [ "$(cat "$throttle" 2>/dev/null || true)" = "$scope" ]; then
+  local quiet=${7-} quiet_kind=${8:-waiting} quiet_detail=${9-} scope_changed=0
+  # The wake reason is supervision evidence and keeps its exact identifiers; the
+  # page is read by the captain, so it gets plain words when the caller supplies
+  # them. A caller that supplies none is recording its own already-plain text.
+  [ -n "$quiet_detail" ] || quiet_detail=$reason
+  # A scope that no longer matches the throttle is a NEW declaration: the wait
+  # itself changed, so it bypasses both the cadence gates below and the quiet
+  # path - a changed declaration is new information and belongs to firstmate.
+  if [ -n "$scope" ] && [ -e "$throttle" ] \
+    && [ "$(cat "$throttle" 2>/dev/null || true)" != "$scope" ]; then
+    scope_changed=1
+  fi
+  if [ "$scope_changed" -eq 0 ]; then
     [ "$age" -ge "$min_age" ] || return 0
     [ "$(age_of "$throttle")" -ge "$PAUSE_RESURFACE_SECS" ] || return 0   # 999999 when no prior re-surface
   fi
+  # The recheck is due, and nothing about the declaration has changed since the
+  # last one. Waking firstmate to read that costs a whole turn to learn nothing,
+  # so record it for the captain and keep the wake for the hard bound. An absent
+  # quiet marker ages as 999999, so the FIRST due recheck still wakes and only the
+  # repeats inside the bound are settled here.
+  if [ -n "$quiet" ] && [ "$scope_changed" -eq 0 ] \
+    && [ "$(age_of "$quiet")" -lt "$QUIET_WAIT_WAKE_SECS" ]; then
+    quiet_feed_record "$quiet_kind" "$(window_to_task "$win" "$STATE")" "$quiet_detail"
+    if [ -n "$scope" ]; then printf '%s' "$scope" > "$throttle"; else date +%s > "$throttle"; fi
+    triage_log "recorded to the quiet feed instead of waking (unchanged declared wait): $reason"
+    return 0
+  fi
   fm_wake_append stale "$win" "$reason" || exit 1
+  [ -z "$quiet" ] || date +%s > "$quiet"
   if [ -n "$scope" ]; then printf '%s' "$scope" > "$throttle"; else date +%s > "$throttle"; fi
   wake "$reason"
 }
@@ -984,7 +1067,7 @@ busy_turn_over_age() {  # <task>
 # wording; a caller that reached the bounded cadence off pause tracking alone, with
 # no declaring verb left on the log, keeps the external-wait wording it always had.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age detail reason declaration last until now min_age
+  local win=$1 task=$2 h=$3 key statusf mtime age detail reason plain declaration last until now min_age
   key=$(window_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
@@ -1005,6 +1088,7 @@ handle_paused_stale() {  # <window> <task> <hash>
     fi
     detail="captain-held, awaiting the captain"
     reason="captain-held ${age}s, awaiting the captain - verified hold transfer, rechecked on a long cadence not a wedge; answer the held decision or release the hold"
+    plain="waiting on you since $(human_secs "$age") ago - already reported to you, not chased again"
   elif until=$(status_paused_until "$last"); then
     if [ "$now" -lt "$until" ] && [ "$age" -lt "$PAUSE_RESURFACE_SECS" ]; then
       triage_log "absorbed stale (paused until $(( until - now ))s from now, declared time not reached): $win"
@@ -1012,19 +1096,23 @@ handle_paused_stale() {  # <window> <task> <hash>
     elif [ "$now" -lt "$until" ]; then
       detail="paused, declared time beyond recheck cadence"
       reason="paused ${age}s, awaiting external - the declared time is beyond the recheck cadence; confirm the wait still holds"
+      plain="waiting on something outside this work, and it says that will not clear for a while yet"
     else
       # The declared time has passed: recheck now, once per declaration, then
       # hold the cadence.
       detail="paused, declared time reached"
       reason="paused ${age}s, awaiting external - the declared clearing time has passed, rechecked on a long cadence not a wedge; confirm the wait cleared"
+      plain="the wait it was expecting should have cleared by now"
       declaration="$declaration:due"
       min_age=0
     fi
   else
     detail="paused, awaiting external"
     reason="paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds"
+    plain="waiting on something outside this work, said so $(human_secs "$age") ago"
   fi
-  resurface_absorbed "$win" "$STATE/.paused-resurfaced-$key" "$age" "stale: $win ($reason)" "$declaration" "$min_age"
+  resurface_absorbed "$win" "$STATE/.paused-resurfaced-$key" "$age" "stale: $win ($reason)" \
+    "$declaration" "$min_age" "$STATE/.paused-quietwake-$key" "waiting" "$plain"
   triage_log "absorbed stale ($detail, age ${age}s): $win"
 }
 
@@ -1092,7 +1180,8 @@ busy_turn_bound_check() {  # <window> <task> <hash> <since-file> <escalation-fil
 
 clear_pause_state() {  # <window-key>
   local key=$1
-  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key" \
+    "$STATE/.paused-quietwake-$key"
 }
 
 # The hash-scoped half of clear_pause_tracking: the stale suppressor, its wedge
@@ -2212,6 +2301,17 @@ $pending
 EOF
         wake "$reason"
       fi
+      # This branch absorbs two different benign shapes - a batch whose worker is
+      # provably still executing, and (opt-in) a bare turn-end whose pane churned.
+      # The captain reads this page, so say which one it actually was rather than
+      # labelling both as a finished turn.
+      # shellcheck disable=SC2086  # $files is a space-separated status/turn-end path list
+      case "$files" in
+        *.status*) quiet_feed_record "still working" "$(signal_batch_subject $files)" \
+          "wrote a routine note and is still working" ;;
+        *) quiet_feed_record "turn ended" "$(signal_batch_subject $files)" \
+          "ended a turn with nothing new to say, and its screen shows it still running" ;;
+      esac
       triage_log "absorbed benign $reason"
     fi
   fi

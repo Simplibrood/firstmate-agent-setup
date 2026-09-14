@@ -175,6 +175,7 @@ table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card);
 th,td{border-bottom:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
 th{background:#eef2f7;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute)}
 td.age{text-align:right;white-space:nowrap;color:var(--mute)}
+td.kind{white-space:nowrap}
 td.old{color:var(--warn);font-weight:600}
 .empty{color:var(--mute);padding:18px 2px}
 .foot{color:var(--mute);font-size:13px;margin-top:14px}
@@ -191,7 +192,7 @@ HEAD
       rows=$(( rows + 1 ))
       age=$(( now - epoch ))
       [ "$age" -ge 0 ] || age=0
-      printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class="age%s">%s</td></tr>\n' \
+      printf '<tr><td>%s</td><td>%s</td><td>%s</td><td class="kind">%s</td><td class="age%s">%s</td></tr>\n' \
         "$(date -d "@$epoch" '+%H:%M' 2>/dev/null || date -r "$epoch" '+%H:%M' 2>/dev/null)" \
         "$(html_escape "$task")" \
         "$(html_escape "$detail")" \

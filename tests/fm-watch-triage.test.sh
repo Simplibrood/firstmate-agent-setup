@@ -2999,6 +2999,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     n=$((n + 1))
   done
   [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] || fail "escalation counter did not persist across consecutive rounds"
+
   unset FM_FAKE_CREW_STATE
   pass "consecutive wedge escalations on the same pane accumulate and demand deep inspection at the threshold"
 }
@@ -4931,3 +4932,136 @@ test_afk_one_shot_never_hands_off_captain_held_under_away_record
 test_paused_until_near_future_is_quiet_before_the_cadence
 test_paused_until_wrong_year_is_bounded_by_the_cadence
 test_paused_until_that_passed_is_rechecked_before_the_cadence
+
+# --- settled events go to the captain's quiet feed instead of a wake -----------
+#
+# The economics these three cases pin: a wake costs a whole firstmate turn and a
+# turn re-reads the entire conversation, so a REPEAT that carries no new
+# information must be settled in the watcher and written to bin/fm-quiet-feed.sh
+# rather than woken on. Each case therefore asserts BOTH halves - no wake, and the
+# event still recorded - because an absorb that records nothing is a lost event,
+# not a saving.
+
+# Wait until the quiet feed's LEDGER (state/) has a row matching <needle>; 1 if
+# the watcher exits first, which is the unfixed behavior (it woke instead of
+# settling the repeat).
+wait_for_quiet_row() {  # <state-dir> <pid> <needle>
+  local state=$1 pid=$2 needle=$3 i=0
+  while [ "$i" -lt 100 ]; do
+    grep -Fq "$needle" "$state/quiet-feed.tsv" 2>/dev/null && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# The PAGE (data/) is rendered from the ledger immediately after the ledger is
+# published, so a reader that saw the row can briefly precede the page. Wait for
+# it rather than racing it.
+wait_for_quiet_page() {  # <data-dir> <pid>
+  local data=$1 pid=$2 i=0
+  while [ "$i" -lt 100 ]; do
+    [ -s "$data/quiet/quiet.html" ] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# A declared wait is rechecked on a long cadence so it cannot rot invisibly. The
+# FIRST due recheck still wakes firstmate; the repeats, while the declaration and
+# the status log are both unchanged, are settled onto the page. The hard bound
+# (FM_QUIET_WAIT_WAKE_SECS) is what keeps "settled" from becoming "forgotten", and
+# the next case proves it still fires.
+test_unchanged_declared_wait_recheck_is_recorded_not_woken() {
+  local dir state data fakebin out capture_file window key pane_hash sig pid statusf back
+  dir=$(make_case quiet-wait-recorded); state="$dir/state"; data="$dir/data"; fakebin="$dir/fakebin"
+  mkdir -p "$data"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-quietwait"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/quietwait.meta"
+  statusf="$state/quietwait.status"
+  printf 'paused: holding for the upstream tool release\n' > "$statusf"
+  # Backdate the declaration so its recheck is already due on the first poll.
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else touch -m -d "@$back" "$statusf"; fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-quietwait_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, holding for upstream")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # This wait has already had its one waking recheck, recently: the quiet budget
+  # is fresh, so this due recheck is a repeat that carries nothing new.
+  date +%s > "$state/.paused-quietwake-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream tool release'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_QUIET_WAIT_WAKE_SECS=86400 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_quiet_row "$state" "$pid" "waiting on something outside this work" \
+    || { reap "$pid"; fail "a repeat recheck of an unchanged declared wait was not recorded to the quiet feed: $(cat "$out")"; }
+  # The page is read by the captain, so the row must carry plain words and none
+  # of the supervision vocabulary AGENTS.md section 9 keeps out of what he reads.
+  for JARGON in 'declared pause' 'wedge' 'captain-held' 'stale:'; do
+    grep -Fq "$JARGON" "$state/quiet-feed.tsv" \
+      && { reap "$pid"; fail "the captain's page carried supervision jargon [$JARGON]: $(cat "$state/quiet-feed.tsv")"; }
+  done
+  [ ! -s "$out" ] || { reap "$pid"; fail "a settled declared-wait recheck printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a settled declared-wait recheck enqueued a durable wake"; }
+  wait_for_quiet_page "$data" "$pid" \
+    || { reap "$pid"; fail "a settled declared-wait recheck did not reach the captain's page"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a repeat recheck of an unchanged declared wait is recorded for the captain instead of waking firstmate"
+}
+
+# The bound. A wait that is settled onto the page forever is a wait nobody looks
+# at, so once the quiet budget is spent one recheck wakes firstmate anyway, with
+# the original reason intact.
+test_declared_wait_still_wakes_past_the_quiet_bound() {
+  local dir state data fakebin out capture_file window key pane_hash sig pid statusf back
+  dir=$(make_case quiet-wait-bound); state="$dir/state"; data="$dir/data"; fakebin="$dir/fakebin"
+  mkdir -p "$data"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-quietbound"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/quietbound.meta"
+  statusf="$state/quietbound.status"
+  printf 'paused: holding for the upstream tool release\n' > "$statusf"
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else touch -m -d "@$back" "$statusf"; fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-quietbound_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, holding for upstream")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  date +%s > "$state/.paused-quietwake-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream tool release'
+  # A one-second budget: this wait has been settled onto the page for longer than
+  # the bound allows, so the recheck is owed a wake.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_QUIET_WAIT_WAKE_SECS=0 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "a declared wait past its quiet bound never woke firstmate"; }
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "the wake past the quiet bound lost its original stale reason: $(cat "$out")"
+  grep -F 'awaiting external' "$out" >/dev/null \
+    || fail "the wake past the quiet bound lost the declared wait's own words: $(cat "$out")"
+  [ -s "$state/.wake-queue" ] || fail "a wake past the quiet bound was not made durable"
+  unset FM_FAKE_CREW_STATE
+  pass "a declared wait still wakes firstmate once its quiet budget is spent, so a settled wait cannot rot"
+}
+
+test_unchanged_declared_wait_recheck_is_recorded_not_woken
+test_declared_wait_still_wakes_past_the_quiet_bound
