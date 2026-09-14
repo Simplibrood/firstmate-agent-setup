@@ -2979,10 +2979,13 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
 
   n=1
   while [ "$n" -le 3 ]; do
-    # Backdate the wedge timer past the threshold before each round, mirroring
-    # the existing wedge-escalation tests' Phase B (the subsequent-sight timer
-    # path does not re-read the crew state).
-    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    # Backdate the wedge timer past THIS round's interval before each round,
+    # mirroring the existing wedge-escalation tests' Phase B (the subsequent-sight
+    # timer path does not re-read the crew state). The interval doubles per prior
+    # escalation while the pane stays unchanged, so a fixed backdate would stall
+    # the ladder at round 3 rather than proving it still arrives: 500s clears the
+    # 240s first interval, 1000s the 480s second, 2000s the 960s third.
+    echo $(( $(date +%s) - (250 * (1 << n)) )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -3000,8 +3003,28 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   done
   [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] || fail "escalation counter did not persist across consecutive rounds"
 
+  # The other half of the same contract: an unchanged pane that has already
+  # escalated must WAIT longer before repeating. A repeat alarm on a pane whose
+  # hash, status log and worktree are all unchanged carries nothing the previous
+  # one did not, and each one costs a whole firstmate turn. With three prior
+  # escalations the next interval is well past 500s, so this round must absorb.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"
+    fail "an unchanged pane repeated its alarm before the backed-off interval: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "a backed-off repeat printed a wake reason: $(cat "$out")"; }
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the backed-off absorb round"
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "a backed-off absorb must not advance the escalation count"
   unset FM_FAKE_CREW_STATE
-  pass "consecutive wedge escalations on the same pane accumulate and demand deep inspection at the threshold"
+  pass "consecutive wedge escalations accumulate to demand deep inspection, and repeats on an unchanged pane back off instead of repeating every interval"
 }
 
 test_wedge_escalation_resets_when_pane_becomes_active() {
@@ -3263,7 +3286,11 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
 
   n=1
   while [ "$n" -le 3 ]; do
-    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    # Past the first escalation the interval doubles while the pane stays
+    # unchanged, so each round is backdated past ITS interval rather than a fixed
+    # amount: 500s clears 240s, 1000s clears 480s, 2000s clears 960s. The
+    # escalation ladder and its threshold are unchanged; only the spacing is.
+    echo $(( $(date +%s) - (250 * (1 << n)) )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -5063,5 +5090,51 @@ test_declared_wait_still_wakes_past_the_quiet_bound() {
   pass "a declared wait still wakes firstmate once its quiet budget is spent, so a settled wait cannot rot"
 }
 
+# A worker that writes ANYTHING is a new situation, so the escalation ladder must
+# start over at the original interval rather than staying backed off. This is the
+# guard that keeps the backoff from hiding a worker that came back and then died.
+test_status_write_resets_the_escalation_backoff() {
+  local dir state data fakebin out capture_file window key pane_hash pid statusf
+  dir=$(make_case quiet-backoff-reset); state="$dir/state"; data="$dir/data"; fakebin="$dir/fakebin"
+  mkdir -p "$data"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-backoffreset"
+  printf 'a quiet pane' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/backoffreset.meta"
+  statusf="$state/backoffreset.status"
+  printf 'working: running the suite\n' > "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-backoffreset_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "a quiet pane")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  # Four prior escalations: without a reset the next one would be far out on the
+  # backed-off ladder rather than at the original interval.
+  printf '4\n' > "$state/.wedge-escalations-$key"
+  # The fingerprint recorded at the last escalation belongs to an EARLIER status
+  # log than the one on disk now, so the worker has written since.
+  printf 'a-stale-fingerprint-from-before-the-write' > "$state/.wedge-statussig-$key"
+  # The idle window is older than the original interval but far short of the
+  # backed-off one, so only a reset can let this escalate now.
+  printf '%s' "$(( $(date +%s) - 30 ))" > "$state/.stale-since-$key"
+  export FM_FAKE_CREW_STATE='state: running · source: no-mistakes · review step active'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=5 FM_WEDGE_BACKOFF_MAX_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "a status write did not reset the escalation backoff: $(cat "$out")"; }
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "the reset escalation lost its stale reason: $(cat "$out")"
+  grep -F 'escalation 1' "$out" >/dev/null \
+    || fail "a status write must restart the ladder at escalation 1, not continue the backed-off chain: $(cat "$out")"
+  unset FM_FAKE_CREW_STATE
+  pass "a worker that writes its status log resets the escalation backoff to the original interval"
+}
+
 test_unchanged_declared_wait_recheck_is_recorded_not_woken
 test_declared_wait_still_wakes_past_the_quiet_bound
+test_status_write_resets_the_escalation_backoff

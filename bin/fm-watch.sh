@@ -678,7 +678,7 @@ signal_turnend_panes_churned() {  # <file> ...
     return 1
   done
   for key in "${churned_keys[@]}"; do
-    if ! rm -f "$STATE/.stale-$key" "$STATE/.wedge-escalations-$key"; then
+    if ! rm -f "$STATE/.stale-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-statussig-$key"; then
       for created in "${created_keys[@]}"; do
         rm -f "$STATE/.churn-since-$created"
       done
@@ -864,6 +864,13 @@ QUIET_FEED_BIN="${FM_QUIET_FEED_BIN:-$SCRIPT_DIR/fm-quiet-feed.sh}"
 QUIET_WAIT_WAKE_SECS=${FM_QUIET_WAIT_WAKE_SECS:-86400}
 case "$QUIET_WAIT_WAKE_SECS" in ''|*[!0-9]*) QUIET_WAIT_WAKE_SECS=86400 ;; esac
 
+# Ceiling for the wedge-escalation backoff below. The interval grows from
+# STALE_ESCALATE_SECS while a pane stays provably unchanged, and stops here: the
+# backoff slows a repeat that carries no new information, and must never become
+# silence.
+WEDGE_BACKOFF_MAX_SECS=${FM_WEDGE_BACKOFF_MAX_SECS:-3600}
+case "$WEDGE_BACKOFF_MAX_SECS" in ''|*[!0-9]*|0) WEDGE_BACKOFF_MAX_SECS=3600 ;; esac
+[ "$WEDGE_BACKOFF_MAX_SECS" -ge "$STALE_ESCALATE_SECS" ] || WEDGE_BACKOFF_MAX_SECS=$STALE_ESCALATE_SECS
 
 # The subject a settled signal batch is recorded under: the one task it names, or
 # a plain count when a coalesced batch spans several. Never a path - the page is
@@ -908,6 +915,21 @@ quiet_feed_record() {  # <kind> <subject> <detail> [next-seconds]
   fi
 }
 
+# The escalation interval for a pane that has already escalated <count> times with
+# nothing about it changing: STALE_ESCALATE_SECS doubled per prior escalation, up
+# to WEDGE_BACKOFF_MAX_SECS. count 0 is the FIRST escalation and is never delayed,
+# so a pane that goes quiet is always looked at on the original schedule; only the
+# repeats on an unchanged pane are slowed.
+wedge_escalate_interval() {  # <prior-escalation-count>
+  local n=$1 interval=$STALE_ESCALATE_SECS i=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  while [ "$i" -lt "$n" ] && [ "$interval" -lt "$WEDGE_BACKOFF_MAX_SECS" ]; do
+    interval=$(( interval * 2 ))
+    i=$(( i + 1 ))
+  done
+  [ "$interval" -le "$WEDGE_BACKOFF_MAX_SECS" ] || interval=$WEDGE_BACKOFF_MAX_SECS
+  printf '%s' "$interval"
+}
 
 # One bounded re-surface for a pane the watcher is deliberately absorbing, so no
 # absorb can rot invisibly. <age> is how long the current absorb has held and
@@ -1005,6 +1027,7 @@ clear_write_tracking() {  # <window-key>
 # never per poll.
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <task>
   local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 since age n reason
+  local key statussig statussig_file prior_n interval next_interval
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -1016,20 +1039,44 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       ;;
     *)
       age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+      # A repeat escalation on a pane whose hash, status log and worktree are all
+      # unchanged carries no information the previous one did not. The pane hash
+      # already resets this chain through clear_stale_hash_tracking, and the
+      # worktree probe below already defers on writes, so the remaining signal to
+      # honour is the task's own status log: if the worker wrote anything, this is
+      # a new situation and the ladder starts again at the original interval.
+      key=$(window_key "$win")
+      statussig_file="$STATE/.wedge-statussig-$key"
+      statussig="$(fm_wake_signal_sig "$STATE/$task.status" 2>/dev/null || true)"
+      prior_n=$(cat "$escalation_file" 2>/dev/null || echo 0)
+      case "$prior_n" in ''|*[!0-9]*) prior_n=0 ;; esac
+      if [ "$prior_n" -gt 0 ] && [ -e "$statussig_file" ] \
+        && [ "$(cat "$statussig_file" 2>/dev/null || true)" != "$statussig" ]; then
+        rm -f "$escalation_file"
+        prior_n=0
+      fi
+      interval=$(wedge_escalate_interval "$prior_n")
+      if [ "$age" -ge "$interval" ]; then
         if crew_worktree_written_since "$task" "$STATE" "$since_file"; then
           wedge_defer_writing "$win" "$since_file" "$label" "$age"
           return 0
         fi
-        n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
+        n=$(( prior_n + 1 ))
         echo "$n" > "$escalation_file"
+        printf '%s' "$statussig" > "$statussig_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
         fi
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
-        clear_write_tracking "$(window_key "$win")"
+        clear_write_tracking "$key"
+        next_interval=$(wedge_escalate_interval "$n")
+        if [ "$n" -gt 1 ]; then
+          quiet_feed_record "quiet pane" "$task" \
+            "quiet for $(human_secs "$age") with nothing changing on screen, in its notes or in its files - still watched" \
+            "$next_interval"
+        fi
         wake "$reason"
       fi
       ;;
@@ -1071,7 +1118,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(window_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.wedge-statussig-$key"
   clear_write_tracking "$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
@@ -1191,7 +1238,8 @@ clear_pause_state() {  # <window-key>
 clear_stale_hash_tracking() {  # <window-key>
   local key=$1
   clear_write_tracking "$key"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
+    "$STATE/.wedge-statussig-$key"
 }
 
 clear_pause_tracking() {  # <window-key>
