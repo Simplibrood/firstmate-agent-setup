@@ -2440,6 +2440,40 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${SPAWN_WT_TOP:-none}'; spawning project '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
+  validate_spawn_context_window
+}
+
+# The compaction ceiling a worker must launch under. Measured 2026-09-14 across
+# 192 sessions: a worker with no window in force ran to 792,073 tokens, and
+# across the 11 that overshot there were 104 turn boundaries above 400,000 with
+# zero compactions - the window was absent, not late. Nothing can truncate a
+# running conversation from outside, so launch time is the only moment a ceiling
+# can be required at all, and this is where it is required.
+SPAWN_CONTEXT_WINDOW_MAX=${FM_WORKER_CONTEXT_WINDOW_MAX:-400000}
+SPAWN_CONTEXT_WINDOW_BIN="${FM_CONTEXT_WINDOW_BIN:-$SCRIPT_DIR/fm-context-window.sh}"
+
+# Refuse to hand a worker its brief unless the window it will read is configured
+# and within the ceiling. This is a LAUNCH-TIME guarantee and deliberately not
+# advertised as more: the same measurement found a session that started after the
+# setting was already in place and still reached 573,797 with no compactions, so
+# a pass here proves the configuration, not the running process. The overshoot
+# detector in bin/fm-context-window.sh is what catches that, and the two are
+# meant to be read together.
+#
+# There is deliberately no bypass flag. Fail closed means fail closed, and a flag
+# that let a dispatch through under an unproven window is exactly the hole this
+# gate exists to close; this repo's own spawn fixtures supply a window instead, so
+# the gate is exercised by every spawn test rather than skipped by them.
+validate_spawn_context_window() {
+  local out
+  [ -x "$SPAWN_CONTEXT_WINDOW_BIN" ] || return 0
+  if ! out=$("$SPAWN_CONTEXT_WINDOW_BIN" verify --max "$SPAWN_CONTEXT_WINDOW_MAX" --cwd "$WT" 2>&1); then
+    echo "error: refusing to launch task ${ID:-?} - its compaction window is not proven to be at most $SPAWN_CONTEXT_WINDOW_MAX tokens." >&2
+    printf '%s
+' "$out" >&2
+    echo "note: a running conversation cannot be truncated from outside, so an unbounded worker cannot be corrected once it starts - that is why this refuses here rather than warning." >&2
+    exit 1
+  fi
 }
 
 # A pooled slot whose only deviation is a submodule gitlink is stale, not dirty:

@@ -151,6 +151,7 @@ state/               runtime records and signals; gitignored
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   quiet-feed.tsv     captain-facing ledger of supervision events the watcher settled without waking firstmate; rendered to data/quiet/quiet.html, bounded by count and age, and written only by bin/fm-quiet-feed.sh, whose header owns the record format and retention
   .quiet-feed.lock .quiet-feed.log   quiet-feed publication lock and its bounded best-effort error log; never touch
+  .context-overshoot .last-context-overshoot   last reported set of sessions that passed their compaction window, and that scan's cadence marker; bin/fm-context-window.sh owns the measurement and `overshoot` reprints it on demand
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored

@@ -954,6 +954,25 @@ Each account, model and voice file above is read as its first line that is not b
 The two read files are parsed differently: `config/voice-read-scope` must hold the bare word and nothing but blank space around it, so a comment header there refuses instead of being skipped, while every line of `config/voice-read-deny` that is not blank and not a `#` comment is one more substring.
 `FM_VOICE_RELAY` and `FM_VOICE_PYTHON` belong to the laptop rather than to a home, so they have no config file: `bin/fm-voice-client.py` requires the relay path as a flag or that variable and carries no default path.
 
+## Compaction window (autoCompactWindow)
+
+A worker's conversation is bounded by the harness setting `autoCompactWindow`, read from the settings scopes the harness itself merges: the project's `.claude/settings.local.json`, then its `.claude/settings.json`, then the user's `~/.claude/settings.json`.
+`bin/fm-context-window.sh` is the one owner of reading that value and of judging whether a session held it; its header owns the exact commands and env knobs.
+
+**There is no lever that truncates a running conversation from outside.**
+Compaction happens inside the agent process.
+Nothing in this repo, and nothing firstmate can run, can make a live session shed context, so there is no runtime ceiling to configure and any claim of one would be false.
+Two real mechanisms exist instead, and they are deliberately different in kind:
+
+- **Launch time.** `bin/fm-spawn.sh` refuses to hand a worker its brief unless the window that worker will read is configured and at most `FM_WORKER_CONTEXT_WINDOW_MAX` (default 400000).
+  There is no bypass flag: an absent, malformed, zero or over-ceiling window fails the dispatch.
+  This binds new workers only.
+- **After the fact.** The watcher scans session records on a bounded cadence and raises `check: context-overshoot` for any session that passed the window it was supposed to hold, firstmate's own session included.
+  The only correct response is to stand that worker down and relaunch it, because it cannot be corrected in place.
+
+A passing launch check proves the configuration, not that the process honours it.
+Measured on 2026-09-14 across 192 sessions, a session started after the setting was already in place still reached 573,797 tokens with zero compactions, which is why the after-the-fact detector exists alongside the launch check rather than instead of it.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):

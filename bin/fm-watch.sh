@@ -99,6 +99,10 @@
 #                          running a check or removing poll artifacts
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
+#   check: context-overshoot a session passed the compaction window it was
+#                          supposed to hold. Reported once per distinct offender
+#                          set; a running conversation cannot be truncated from
+#                          outside, so the response is a stand-down and relaunch
 #   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
 #                          inactive terminal outcome that still lacks its durable
 #                          upstream receipt
@@ -211,6 +215,12 @@ WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-$(fm_poll_derive
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
+# Seconds between context-overshoot scans. Longer than CHECK_INTERVAL because the
+# scan reads session transcripts and an overshoot is a slow-moving condition: a
+# session that passed its window stays passed, and the wake is deduplicated on the
+# offender set anyway.
+CONTEXT_OVERSHOOT_INTERVAL=${FM_CONTEXT_OVERSHOOT_INTERVAL:-900}
+case "$CONTEXT_OVERSHOOT_INTERVAL" in ''|*[!0-9]*|0) CONTEXT_OVERSHOOT_INTERVAL=900 ;; esac
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 HOME_SUMMARY_INTERVAL=${FM_HOME_SUMMARY_INTERVAL:-300}
 case "$HOME_SUMMARY_INTERVAL" in
@@ -2149,6 +2159,29 @@ while :; do
     fi
     if [ -n "$pause_resume_out" ]; then
       wake "check: pause-resume"
+    fi
+  fi
+
+  # Context overshoot: a session that passed the compaction window it was supposed
+  # to hold. Measured 2026-09-14, a worker with no window in force ran to 792,073
+  # tokens and nobody noticed until the captain looked. Nothing here can truncate a
+  # running conversation, so the only honest response is to surface it for a
+  # stand-down and relaunch - which makes it an ACTIONABLE wake, never a quiet-feed
+  # row. Reported once per distinct set of offenders (.context-overshoot holds the
+  # last reported set) so a worker that keeps growing does not re-wake every
+  # cadence, and rides the same bounded cadence as the checks below rather than
+  # running on every poll.
+  if [ "$(age_of "$STATE/.last-context-overshoot")" -ge "$CONTEXT_OVERSHOOT_INTERVAL" ]; then
+    date +%s > "$STATE/.last-context-overshoot" 2>/dev/null || true
+    overshoot_out=
+    if overshoot_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-context-window.sh" overshoot 2>/dev/null); then
+      if [ -n "$overshoot_out" ] \
+        && [ "$overshoot_out" != "$(cat "$STATE/.context-overshoot" 2>/dev/null || true)" ]; then
+        printf '%s' "$overshoot_out" > "$STATE/.context-overshoot" 2>/dev/null || true
+        fm_wake_append check context-overshoot "check: context-overshoot" || exit 1
+        wake "check: context-overshoot"
+      fi
     fi
   fi
 

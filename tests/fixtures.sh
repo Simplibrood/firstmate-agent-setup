@@ -286,7 +286,16 @@ fm_test_run_spawn() {
   # so every launch-shape assertion in the suite keeps reading the same command.
   # A test that needs the set case opts in through FM_TEST_CLAUDE_CONFIG_DIR.
   local spawn_home=$home/user-home
-  mkdir -p "$spawn_home"
+  mkdir -p "$spawn_home/.claude"
+  # bin/fm-spawn.sh refuses to launch a worker whose compaction window is not
+  # proven to be within the worker ceiling, because nothing can truncate a running
+  # conversation from outside and launch time is the only moment a ceiling can be
+  # required. The throwaway HOME has no settings of its own, so the fixture supplies
+  # one: every spawn in this suite then exercises that gate for real and passes it,
+  # rather than bypassing it and leaving the refusal untested in the spawn path.
+  # A test that wants the refusal removes this file.
+  [ -e "$spawn_home/.claude/settings.json" ] \
+    || printf '{"autoCompactWindow": 400000}\n' > "$spawn_home/.claude/settings.json"
   FM_ROOT_OVERRIDE='' FM_HOME="$home" HOME="$spawn_home" \
     CLAUDE_CONFIG_DIR="${FM_TEST_CLAUDE_CONFIG_DIR:-}" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
